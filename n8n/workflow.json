@@ -1,0 +1,524 @@
+{
+  "name": "DevSecOps — SOC Response Orchestration",
+  "nodes": [
+
+    {
+      "id": "1a2b3c4d-0001-0000-0000-000000000001",
+      "name": "Webhook — Receive SNS Alarm",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 60],
+      "webhookId": "sns-alert-receiver",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "sns-alert",
+        "responseMode": "onReceived",
+        "responseData": "allEntries",
+        "options": {}
+      }
+    },
+
+    {
+      "id": "1a2b3c4d-0002-0000-0000-000000000002",
+      "name": "Parse SNS + CloudWatch Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 240],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// SNS delivers the CloudWatch alarm data double-serialised:\n// body (outer SNS envelope) → body.Message (inner CloudWatch JSON string).\n// Handle the SubscriptionConfirmation type so Terraform apply doesn't\n// accidentally trigger the SOC workflow during infrastructure setup.\n\nconst raw = $input.first().json;\nconst body = raw.body ?? raw;\nconst sns = typeof body === 'string' ? JSON.parse(body) : body;\n\n// AWS sends a SubscriptionConfirmation before live notifications.\n// Log it and stop — the bridge setup guide covers manual confirmation.\nif (sns.Type === 'SubscriptionConfirmation') {\n  console.log('SNS SubscriptionConfirmation received. Visit SubscribeURL to confirm:');\n  console.log(sns.SubscribeURL);\n  return [];\n}\n\nif (sns.Type !== 'Notification') {\n  console.log('Unexpected SNS Type:', sns.Type);\n  return [];\n}\n\n// Inner CloudWatch alarm payload is a JSON string inside sns.Message\nconst alarm = JSON.parse(sns.Message);\nconst dims = alarm.Trigger?.Dimensions ?? [];\n\nconst get = (name) => dims.find(d => d.name === name)?.value ?? 'unknown';\n\nreturn [{\n  json: {\n    alarmName:   alarm.AlarmName,\n    alarmState:  alarm.NewStateValue,\n    stateReason: alarm.NewStateReason,\n    stateTime:   alarm.StateChangeTime,\n    accountId:   alarm.AWSAccountId,\n    webAclName:  get('WebACL'),\n    ruleName:    get('Rule'),\n    awsRegion:   get('Region'),\n    snsSubject:  sns.Subject,\n    rawAlarm:    alarm,\n  }\n}];"
+      }
+    },
+
+    {
+      "id": "1a2b3c4d-0003-0000-0000-000000000003",
+      "name": "Only Continue if ALARM State",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [240, 420],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "cond-alarm-state",
+              "leftValue": "={{ $json.alarmState }}",
+              "rightValue": "ALARM",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+
+    {
+      "id": "1a2b3c4d-0004-0000-0000-000000000004",
+      "name": "End — Not an Active Alarm",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [560, 540],
+      "parameters": {}
+    },
+
+    {
+      "id": "1a2b3c4d-0005-0000-0000-000000000005",
+      "name": "Query Splunk — Top Attacker Context",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 600],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.SPLUNK_URL }}/services/search/jobs",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "search",
+              "value": "=search index=devsecops_security sourcetype=\"aws:waf\" action=BLOCK earliest=-1h latest=now | stats count as total_blocked dc(httpRequest.uri) as unique_uri_count values(httpRequest.uri) as targeted_endpoints values(httpRequest.country) as countries earliest(_time) as first_epoch latest(_time) as last_epoch by httpRequest.clientIp | eval attack_duration=tostring(last_epoch - first_epoch, \"duration\") | eval first_seen=strftime(first_epoch, \"%Y-%m-%d %H:%M:%S UTC\") | eval last_seen=strftime(last_epoch, \"%Y-%m-%d %H:%M:%S UTC\") | sort -total_blocked | head 1"
+            },
+            { "name": "output_mode",   "value": "json"     },
+            { "name": "exec_mode",     "value": "oneshot"  },
+            { "name": "earliest_time", "value": "-1h"      },
+            { "name": "latest_time",   "value": "now"      }
+          ]
+        },
+        "options": { "timeout": 60000 }
+      },
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "REPLACE_WITH_SPLUNK_CREDENTIAL_ID",
+          "name": "Splunk Admin"
+        }
+      }
+    },
+
+    {
+      "id": "1a2b3c4d-0006-0000-0000-000000000006",
+      "name": "Parse Splunk Attacker Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 780],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const splunkResponse = $input.first().json;\nconst results = splunkResponse.results ?? [];\n\n// Carry forward alarm context from earlier in the workflow\nconst alarmCtx = $('Parse SNS + CloudWatch Payload').first().json;\n\nif (results.length === 0) {\n  // No blocked events in Splunk yet (propagation lag) — use defaults\n  return [{\n    json: {\n      ...alarmCtx,\n      attackerIp:        'unknown (data not yet in Splunk)',\n      totalBlocked:      'N/A',\n      uniqueUriCount:    'N/A',\n      targetedEndpoints: [],\n      countries:         [],\n      firstSeen:         'N/A',\n      lastSeen:          'N/A',\n      attackDuration:    'N/A',\n      splunkHasData:     false,\n    }\n  }];\n}\n\nconst top = results[0];\nconst endpoints = Array.isArray(top.targeted_endpoints)\n  ? top.targeted_endpoints\n  : [top.targeted_endpoints].filter(Boolean);\nconst countries = Array.isArray(top.countries)\n  ? top.countries\n  : [top.countries].filter(Boolean);\n\nreturn [{\n  json: {\n    ...alarmCtx,\n    attackerIp:        top['httpRequest.clientIp'] ?? top.clientIp ?? 'unknown',\n    totalBlocked:      top.total_blocked,\n    uniqueUriCount:    top.unique_uri_count,\n    targetedEndpoints: endpoints,\n    countries:         countries,\n    firstSeen:         top.first_seen,\n    lastSeen:          top.last_seen,\n    attackDuration:    top.attack_duration,\n    splunkHasData:     true,\n  }\n}];"
+      }
+    },
+
+    {
+      "id": "1a2b3c4d-0007-0000-0000-000000000007",
+      "name": "Create Outline Incident Report",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 960],
+      "parameters": {
+        "method": "POST",
+        "url": "https://app.getoutline.com/api/documents.create",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"title\": \"🚨 Incident — WAF Attack from {{ $json.attackerIp }} | {{ $json.stateTime.slice(0,10) }}\",\n  \"text\": \"# Security Incident Report\\n\\n> **Status:** 🔴 ACTIVE — Awaiting Admin Decision\\n\\n---\\n\\n## Incident Summary\\n\\n| Field | Value |\\n|---|---|\\n| **Alarm** | `{{ $json.alarmName }}` |\\n| **Triggered** | {{ $json.stateTime }} |\\n| **WAF Rule** | {{ $json.ruleName }} |\\n| **Web ACL** | {{ $json.webAclName }} |\\n| **AWS Account** | {{ $json.accountId }} |\\n| **Region** | {{ $json.awsRegion }} |\\n\\n**Trigger reason:** {{ $json.stateReason }}\\n\\n---\\n\\n## Attacker Profile *(via Splunk)*\\n\\n| Field | Value |\\n|---|---|\\n| **Source IP** | `{{ $json.attackerIp }}` |\\n| **Total Blocked Requests** | {{ $json.totalBlocked }} |\\n| **Unique Endpoints Hit** | {{ $json.uniqueUriCount }} |\\n| **Targeted Paths** | `{{ $json.targetedEndpoints.join(', ') }}` |\\n| **Country** | {{ $json.countries.join(', ') }} |\\n| **First Seen** | {{ $json.firstSeen }} |\\n| **Last Seen** | {{ $json.lastSeen }} |\\n| **Attack Duration** | {{ $json.attackDuration }} |\\n\\n---\\n\\n## Evidence Links\\n\\n- 🔍 [Splunk Dashboard — Live]({{ $vars.SPLUNK_DASHBOARD_URL }})\\n- 🔍 [Filter by attacker IP]({{ $vars.SPLUNK_URL.replace('8089','8000') }}/en-US/app/search/search?q=index%3Ddevsecops_security+httpRequest.clientIp%3D%22{{ $json.attackerIp }}%22)\\n\\n---\\n\\n## Response\\n\\n| Field | Value |\\n|---|---|\\n| **Analyst** | Pending |\\n| **Action Taken** | Pending |\\n| **Resolution Time** | Pending |\\n\\n---\\n\\n*Auto-generated by n8n SOC Orchestration Workflow*\",\n  \"collectionId\": \"{{ $vars.OUTLINE_COLLECTION_ID }}\",\n  \"publish\": true\n}",
+        "options": { "timeout": 30000 }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_OUTLINE_CREDENTIAL_ID",
+          "name": "Outline Bearer Token"
+        }
+      }
+    },
+
+    {
+      "id": "1a2b3c4d-0008-0000-0000-000000000008",
+      "name": "Build HITL Email HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 1140],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Build the Human-in-the-Loop email.\n// $execution.resumeUrl is the unique URL for THIS workflow execution.\n// Appending ?action=block / ?action=ignore routes the decision back to the workflow.\nconst ctx = $input.first().json;\nconst outlineDoc = $('Create Outline Incident Report').first().json.data;\n\nconst resumeBase = $execution.resumeUrl;\nconst blockUrl   = `${resumeBase}?action=block`;\nconst ignoreUrl  = `${resumeBase}?action=ignore`;\nconst outlineUrl = outlineDoc?.url ?? '#';\nconst docId      = outlineDoc?.id  ?? '';\n\nconst endpointList = (ctx.targetedEndpoints ?? []).map(e => `<li><code>${e}</code></li>`).join('');\n\nconst html = `\n<!DOCTYPE html>\n<html>\n<head><meta charset=\"UTF-8\"></head>\n<body style=\"margin:0;padding:0;background:#1a1a2e;font-family:Arial,sans-serif;\">\n  <table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\">\n    <tr><td align=\"center\" style=\"padding:20px 10px;\">\n      <table width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#16213e;border-radius:12px;overflow:hidden;\">\n\n        <!-- Header -->\n        <tr><td style=\"background:#dc4e41;padding:28px 32px;\">\n          <h1 style=\"margin:0;color:#fff;font-size:22px;\">&#x1F6A8; WAF Layer 7 Attack Detected</h1>\n          <p style=\"margin:8px 0 0;color:#ffd0cc;font-size:14px;\">CloudWatch Alarm: <strong>${ctx.alarmName}</strong></p>\n        </td></tr>\n\n        <!-- Attacker details -->\n        <tr><td style=\"padding:24px 32px;\">\n          <h2 style=\"color:#e0e0e0;margin:0 0 16px;\">&#x1F575; Attacker Profile</h2>\n          <table width=\"100%\" style=\"border-collapse:collapse;font-size:14px;\">\n            <tr style=\"border-bottom:1px solid #2a2a4a;\">\n              <td style=\"color:#aaa;padding:8px 0;width:40%;\">Source IP</td>\n              <td style=\"color:#fff;font-weight:bold;font-family:monospace;\">${ctx.attackerIp}</td>\n            </tr>\n            <tr style=\"border-bottom:1px solid #2a2a4a;\">\n              <td style=\"color:#aaa;padding:8px 0;\">Blocked Requests</td>\n              <td style=\"color:#f1813f;font-weight:bold;\">${ctx.totalBlocked}</td>\n            </tr>\n            <tr style=\"border-bottom:1px solid #2a2a4a;\">\n              <td style=\"color:#aaa;padding:8px 0;\">Attack Duration</td>\n              <td style=\"color:#fff;\">${ctx.attackDuration}</td>\n            </tr>\n            <tr style=\"border-bottom:1px solid #2a2a4a;\">\n              <td style=\"color:#aaa;padding:8px 0;\">Targeted Endpoints</td>\n              <td style=\"color:#fff;\"><ul style=\"margin:4px 0;padding-left:18px;\">${endpointList}</ul></td>\n            </tr>\n            <tr style=\"border-bottom:1px solid #2a2a4a;\">\n              <td style=\"color:#aaa;padding:8px 0;\">Country</td>\n              <td style=\"color:#fff;\">${(ctx.countries ?? []).join(', ')}</td>\n            </tr>\n            <tr>\n              <td style=\"color:#aaa;padding:8px 0;\">Triggered At</td>\n              <td style=\"color:#fff;\">${ctx.stateTime}</td>\n            </tr>\n          </table>\n        </td></tr>\n\n        <!-- Evidence links -->\n        <tr><td style=\"padding:0 32px 24px;\">\n          <h2 style=\"color:#e0e0e0;margin:0 0 12px;\">&#x1F4CB; Evidence</h2>\n          <p style=\"margin:0 0 8px;\">\n            <a href=\"${outlineUrl}\" style=\"color:#53a051;\">&#x1F4C4; View Outline Incident Report</a>\n          </p>\n          <p style=\"margin:0;\">\n            <a href=\"${ctx.splunkDashboardUrl ?? $vars.SPLUNK_DASHBOARD_URL}\" style=\"color:#53a051;\">&#x1F50D; View Splunk SOC Dashboard</a>\n          </p>\n        </td></tr>\n\n        <!-- HITL action buttons -->\n        <tr><td style=\"padding:24px 32px;background:#0f0f23;\">\n          <h2 style=\"color:#e0e0e0;margin:0 0 20px;text-align:center;\">&#x1F6CE; Admin Action Required</h2>\n          <p style=\"color:#aaa;text-align:center;margin:0 0 24px;font-size:13px;\">\n            Review the evidence, then choose an action.<br>This link expires when the workflow times out.\n          </p>\n          <table width=\"100%\"><tr>\n            <td align=\"center\" style=\"padding:0 8px;\">\n              <a href=\"${blockUrl}\"\n                 style=\"display:inline-block;padding:16px 32px;background:#dc4e41;color:#fff;\n                        text-decoration:none;border-radius:8px;font-size:16px;\n                        font-weight:bold;letter-spacing:0.5px;\">\n                &#x1F6AB; BLOCK IP PERMANENTLY\n              </a>\n            </td>\n            <td align=\"center\" style=\"padding:0 8px;\">\n              <a href=\"${ignoreUrl}\"\n                 style=\"display:inline-block;padding:16px 32px;background:#53a051;color:#fff;\n                        text-decoration:none;border-radius:8px;font-size:16px;font-weight:bold;\">\n                &#x2713; Ignore &amp; Monitor\n              </a>\n            </td>\n          </tr></table>\n        </td></tr>\n\n        <!-- Footer -->\n        <tr><td style=\"padding:16px 32px;background:#0a0a1a;text-align:center;\">\n          <p style=\"color:#555;font-size:12px;margin:0;\">\n            Sent by n8n SOC Orchestration Workflow &bull; DevSecOps Self-Healing Cloud\n          </p>\n        </td></tr>\n\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>`;\n\nreturn [{\n  json: {\n    ...ctx,\n    outlineDocId:  docId,\n    outlineDocUrl: outlineUrl,\n    blockUrl,\n    ignoreUrl,\n    emailHtml: html,\n    emailSubject: `🚨 WAF Alert — ${ctx.attackerIp} | ${ctx.totalBlocked} blocked requests | Action Required`,\n  }\n}];"
+      }
+    },
+
+    {
+      "id": "1a2b3c4d-0009-0000-0000-000000000009",
+      "name": "Send HITL Alert to Admin",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [240, 1320],
+      "parameters": {
+        "fromEmail": "={{ $vars.ADMIN_EMAIL }}",
+        "toEmail":   "={{ $vars.ADMIN_EMAIL }}",
+        "subject":   "={{ $json.emailSubject }}",
+        "emailType": "html",
+        "html":      "={{ $json.emailHtml }}",
+        "options":   {}
+      },
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_WITH_SMTP_CREDENTIAL_ID",
+          "name": "Gmail SMTP"
+        }
+      }
+    },
+
+    {
+      "id": "1a2b3c4d-0010-0000-0000-000000000010",
+      "name": "Wait — Admin Decision via Email",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [240, 1500],
+      "webhookId": "admin-decision-gate",
+      "parameters": {
+        "resume": "webhook",
+        "options": {
+          "webhookSuffix": "decision"
+        }
+      }
+    },
+
+    {
+      "id": "1a2b3c4d-0011-0000-0000-000000000011",
+      "name": "Route — Block or Ignore",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [240, 1680],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "cond-action-block",
+              "leftValue":  "={{ $json.query?.action ?? $json.action ?? '' }}",
+              "rightValue": "block",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+
+    {
+      "id": "1a2b3c4d-0012-0000-0000-000000000012",
+      "name": "Get WAF IP Set — Fetch Lock Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-120, 1860],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://wafv2.{{ $vars.AWS_REGION }}.amazonaws.com/",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "aws",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Amz-Target",  "value": "AWSWAF_20190729.GetIPSet"          },
+            { "name": "Content-Type",   "value": "application/x-amz-json-1.1"        }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"Id\":    \"{{ $vars.WAF_IP_SET_ID }}\",\n  \"Name\":  \"{{ $vars.WAF_IP_SET_NAME }}\",\n  \"Scope\": \"REGIONAL\"\n}",
+        "options": { "timeout": 15000 }
+      },
+      "credentials": {
+        "aws": {
+          "id": "REPLACE_WITH_AWS_CREDENTIAL_ID",
+          "name": "AWS — WAF Access"
+        }
+      }
+    },
+
+    {
+      "id": "1a2b3c4d-0013-0000-0000-000000000013",
+      "name": "Merge Attacker IP into Blocklist",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-120, 2040],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Merge the new attacker IP into the existing IPSet addresses.\n// WAF requires all addresses to be in CIDR notation.\nconst ipSetResponse = $('Get WAF IP Set — Fetch Lock Token').first().json;\nconst splunkData    = $('Parse Splunk Attacker Data').first().json;\n\nconst lockToken      = ipSetResponse.LockToken;\nconst existingAddrs  = ipSetResponse.IPSet?.Addresses ?? [];\nconst attackerIp     = splunkData.attackerIp;\n\nif (!attackerIp || attackerIp === 'unknown' || !attackerIp.match(/^\\d+\\.\\d+\\.\\d+\\.\\d+$/)) {\n  throw new Error(`Cannot block invalid IP address: '${attackerIp}'`);\n}\n\nconst newCidr    = `${attackerIp}/32`;\nconst merged     = [...new Set([...existingAddrs, newCidr])];\n\nreturn [{\n  json: {\n    lockToken,\n    mergedAddresses: merged,\n    blockedIp: newCidr,\n    previousCount: existingAddrs.length,\n    newCount: merged.length,\n  }\n}];"
+      }
+    },
+
+    {
+      "id": "1a2b3c4d-0014-0000-0000-000000000014",
+      "name": "Block IP — Update WAF IP Set",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-120, 2220],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://wafv2.{{ $vars.AWS_REGION }}.amazonaws.com/",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "aws",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Amz-Target", "value": "AWSWAF_20190729.UpdateIPSet"        },
+            { "name": "Content-Type",  "value": "application/x-amz-json-1.1"        }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"Id\":        \"{{ $vars.WAF_IP_SET_ID }}\",\n  \"Name\":      \"{{ $vars.WAF_IP_SET_NAME }}\",\n  \"Scope\":     \"REGIONAL\",\n  \"Addresses\": {{ JSON.stringify($json.mergedAddresses) }},\n  \"LockToken\": \"{{ $json.lockToken }}\"\n}",
+        "options": { "timeout": 15000 }
+      },
+      "credentials": {
+        "aws": {
+          "id": "REPLACE_WITH_AWS_CREDENTIAL_ID",
+          "name": "AWS — WAF Access"
+        }
+      }
+    },
+
+    {
+      "id": "1a2b3c4d-0015-0000-0000-000000000015",
+      "name": "Update Outline — Status: Blocked",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-120, 2400],
+      "parameters": {
+        "method": "POST",
+        "url": "https://app.getoutline.com/api/documents.update",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"id\": \"{{ $('Build HITL Email HTML').first().json.outlineDocId }}\",\n  \"text\": \"# Security Incident Report\\n\\n> **Status:** ✅ RESOLVED — IP Blocked\\n\\n---\\n\\n## Incident Summary\\n\\n| Field | Value |\\n|---|---|\\n| **Alarm** | `{{ $('Parse Splunk Attacker Data').first().json.alarmName }}` |\\n| **Triggered** | {{ $('Parse Splunk Attacker Data').first().json.stateTime }} |\\n| **WAF Rule** | {{ $('Parse Splunk Attacker Data').first().json.ruleName }} |\\n\\n---\\n\\n## Attacker Profile\\n\\n| Field | Value |\\n|---|---|\\n| **Source IP** | `{{ $('Parse Splunk Attacker Data').first().json.attackerIp }}` |\\n| **Blocked Requests** | {{ $('Parse Splunk Attacker Data').first().json.totalBlocked }} |\\n| **Duration** | {{ $('Parse Splunk Attacker Data').first().json.attackDuration }} |\\n\\n---\\n\\n## Response\\n\\n| Field | Value |\\n|---|---|\\n| **Action Taken** | ✅ IP Permanently Blocked in AWS WAF IP Set |\\n| **WAF IP Set** | `{{ $vars.WAF_IP_SET_NAME }}` |\\n| **Blocked CIDR** | `{{ $('Merge Attacker IP into Blocklist').first().json.blockedIp }}` |\\n| **Total IPs in Blocklist** | {{ $('Merge Attacker IP into Blocklist').first().json.newCount }} |\\n\\n---\\n\\n*Resolved by admin via n8n HITL workflow*\",\n  \"publish\": true\n}",
+        "options": { "timeout": 15000 }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_OUTLINE_CREDENTIAL_ID",
+          "name": "Outline Bearer Token"
+        }
+      }
+    },
+
+    {
+      "id": "1a2b3c4d-0016-0000-0000-000000000016",
+      "name": "Send Block Confirmation Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [-120, 2580],
+      "parameters": {
+        "fromEmail": "={{ $vars.ADMIN_EMAIL }}",
+        "toEmail":   "={{ $vars.ADMIN_EMAIL }}",
+        "subject":   "=✅ IP Blocked — {{ $('Parse Splunk Attacker Data').first().json.attackerIp }} added to WAF blocklist",
+        "emailType": "html",
+        "html": "=<div style=\"font-family:Arial,sans-serif;max-width:500px;\">\n  <div style=\"background:#53a051;color:white;padding:20px;border-radius:8px 8px 0 0;\">\n    <h2 style=\"margin:0;\">&#x2705; IP Permanently Blocked</h2>\n  </div>\n  <div style=\"padding:20px;background:#f9f9f9;border:1px solid #ddd;border-radius:0 0 8px 8px;\">\n    <p><strong>Blocked IP:</strong> <code>{{ $('Parse Splunk Attacker Data').first().json.attackerIp }}/32</code></p>\n    <p><strong>WAF IP Set:</strong> {{ $vars.WAF_IP_SET_NAME }}</p>\n    <p><strong>Total IPs in blocklist:</strong> {{ $('Merge Attacker IP into Blocklist').first().json.newCount }}</p>\n    <p><strong>Original blocked requests:</strong> {{ $('Parse Splunk Attacker Data').first().json.totalBlocked }}</p>\n    <p>&#x1F4C4; <a href=\"{{ $('Build HITL Email HTML').first().json.outlineDocUrl }}\">View Incident Report in Outline</a></p>\n    <hr>\n    <p style=\"color:#888;font-size:12px;\">n8n SOC Orchestration Workflow &bull; DevSecOps Self-Healing Cloud</p>\n  </div>\n</div>",
+        "options": {}
+      },
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_WITH_SMTP_CREDENTIAL_ID",
+          "name": "Gmail SMTP"
+        }
+      }
+    },
+
+    {
+      "id": "1a2b3c4d-0017-0000-0000-000000000017",
+      "name": "Update Outline — Status: Ignored",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [620, 1860],
+      "parameters": {
+        "method": "POST",
+        "url": "https://app.getoutline.com/api/documents.update",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"id\": \"{{ $('Build HITL Email HTML').first().json.outlineDocId }}\",\n  \"text\": \"# Security Incident Report\\n\\n> **Status:** ⚪ CLOSED — False Positive / Monitoring\\n\\n---\\n\\n## Incident Summary\\n\\n| Field | Value |\\n|---|---|\\n| **Alarm** | `{{ $('Parse Splunk Attacker Data').first().json.alarmName }}` |\\n| **Triggered** | {{ $('Parse Splunk Attacker Data').first().json.stateTime }} |\\n| **Source IP** | `{{ $('Parse Splunk Attacker Data').first().json.attackerIp }}` |\\n| **Blocked Requests** | {{ $('Parse Splunk Attacker Data').first().json.totalBlocked }} |\\n\\n---\\n\\n## Response\\n\\n| Field | Value |\\n|---|---|\\n| **Action Taken** | ⚪ Ignored — Flagged for continued monitoring |\\n| **Rationale** | Admin reviewed and determined no permanent block required |\\n\\n---\\n\\n*Closed by admin via n8n HITL workflow — no WAF change made*\",\n  \"publish\": true\n}",
+        "options": { "timeout": 15000 }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_OUTLINE_CREDENTIAL_ID",
+          "name": "Outline Bearer Token"
+        }
+      }
+    },
+
+    {
+      "id": "1a2b3c4d-0018-0000-0000-000000000018",
+      "name": "End — Incident Closed (Ignored)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [620, 2040],
+      "parameters": {}
+    }
+
+  ],
+
+  "connections": {
+    "Webhook — Receive SNS Alarm": {
+      "main": [[
+        { "node": "Parse SNS + CloudWatch Payload", "type": "main", "index": 0 }
+      ]]
+    },
+    "Parse SNS + CloudWatch Payload": {
+      "main": [[
+        { "node": "Only Continue if ALARM State", "type": "main", "index": 0 }
+      ]]
+    },
+    "Only Continue if ALARM State": {
+      "main": [
+        [{ "node": "Query Splunk — Top Attacker Context", "type": "main", "index": 0 }],
+        [{ "node": "End — Not an Active Alarm",           "type": "main", "index": 0 }]
+      ]
+    },
+    "Query Splunk — Top Attacker Context": {
+      "main": [[
+        { "node": "Parse Splunk Attacker Data", "type": "main", "index": 0 }
+      ]]
+    },
+    "Parse Splunk Attacker Data": {
+      "main": [[
+        { "node": "Create Outline Incident Report", "type": "main", "index": 0 }
+      ]]
+    },
+    "Create Outline Incident Report": {
+      "main": [[
+        { "node": "Build HITL Email HTML", "type": "main", "index": 0 }
+      ]]
+    },
+    "Build HITL Email HTML": {
+      "main": [[
+        { "node": "Send HITL Alert to Admin", "type": "main", "index": 0 }
+      ]]
+    },
+    "Send HITL Alert to Admin": {
+      "main": [[
+        { "node": "Wait — Admin Decision via Email", "type": "main", "index": 0 }
+      ]]
+    },
+    "Wait — Admin Decision via Email": {
+      "main": [[
+        { "node": "Route — Block or Ignore", "type": "main", "index": 0 }
+      ]]
+    },
+    "Route — Block or Ignore": {
+      "main": [
+        [{ "node": "Get WAF IP Set — Fetch Lock Token", "type": "main", "index": 0 }],
+        [{ "node": "Update Outline — Status: Ignored",  "type": "main", "index": 0 }]
+      ]
+    },
+    "Get WAF IP Set — Fetch Lock Token": {
+      "main": [[
+        { "node": "Merge Attacker IP into Blocklist", "type": "main", "index": 0 }
+      ]]
+    },
+    "Merge Attacker IP into Blocklist": {
+      "main": [[
+        { "node": "Block IP — Update WAF IP Set", "type": "main", "index": 0 }
+      ]]
+    },
+    "Block IP — Update WAF IP Set": {
+      "main": [[
+        { "node": "Update Outline — Status: Blocked", "type": "main", "index": 0 }
+      ]]
+    },
+    "Update Outline — Status: Blocked": {
+      "main": [[
+        { "node": "Send Block Confirmation Email", "type": "main", "index": 0 }
+      ]]
+    },
+    "Update Outline — Status: Ignored": {
+      "main": [[
+        { "node": "End — Incident Closed (Ignored)", "type": "main", "index": 0 }
+      ]]
+    }
+  },
+
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "id": "devsecops-soc-response-v1",
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "REPLACE_WITH_YOUR_N8N_INSTANCE_ID"
+  },
+  "tags": [
+    { "id": "tag-devsecops", "name": "DevSecOps" },
+    { "id": "tag-soc",       "name": "SOC"       }
+  ],
+
+  "_setup_instructions": {
+    "description": "n8n Variables to configure before activating (Settings → Variables)",
+    "variables": {
+      "SPLUNK_URL":             "http://host.docker.internal:8089  (or http://splunk-devsecops:8089 if on shared Docker network)",
+      "SPLUNK_DASHBOARD_URL":   "http://localhost:8000/en-US/app/search/devsecops_dashboard",
+      "OUTLINE_COLLECTION_ID":  "Get from Outline: Settings → Collections → copy the UUID from the URL",
+      "ADMIN_EMAIL":            "elinor.einav@gmail.com",
+      "WAF_IP_SET_ID":          "From: terraform -chdir=terraform output -raw waf_blocklist_ip_set_id",
+      "WAF_IP_SET_NAME":        "From: terraform -chdir=terraform output -raw waf_blocklist_ip_set_name",
+      "AWS_REGION":             "us-east-1"
+    },
+    "credentials_to_create": [
+      {
+        "name": "Splunk Admin",
+        "type": "HTTP Basic Auth",
+        "replace_id": "REPLACE_WITH_SPLUNK_CREDENTIAL_ID",
+        "values": { "user": "admin", "password": "<SPLUNK_ADMIN_PASSWORD from .env>" }
+      },
+      {
+        "name": "Outline Bearer Token",
+        "type": "HTTP Header Auth",
+        "replace_id": "REPLACE_WITH_OUTLINE_CREDENTIAL_ID",
+        "values": { "name": "Authorization", "value": "Bearer <your_outline_api_token>" }
+      },
+      {
+        "name": "Gmail SMTP",
+        "type": "SMTP",
+        "replace_id": "REPLACE_WITH_SMTP_CREDENTIAL_ID",
+        "values": {
+          "host": "smtp.gmail.com",
+          "port": 465,
+          "ssl": true,
+          "user": "<gmail_address>",
+          "password": "<gmail_app_password>"
+        }
+      },
+      {
+        "name": "AWS — WAF Access",
+        "type": "AWS",
+        "replace_id": "REPLACE_WITH_AWS_CREDENTIAL_ID",
+        "values": {
+          "region": "<AWS_REGION>",
+          "accessKeyId": "<IAM_ACCESS_KEY with wafv2:GetIPSet + wafv2:UpdateIPSet>",
+          "secretAccessKey": "<IAM_SECRET_KEY>"
+        }
+      }
+    ]
+  }
+}

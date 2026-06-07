@@ -1,0 +1,41 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# terraform.tfvars is listed in .gitignore — never commit it.
+# For the Splunk HEC token, prefer the environment variable:
+#   export TF_VAR_splunk_hec_token="your-token-here"
+
+# ── Core ─────────────────────────────────────────────────────────────────────
+aws_region   = "us-east-1"
+project_name = "devsecops"
+environment  = "prod"
+
+# ── EC2 ──────────────────────────────────────────────────────────────────────
+# Name of an existing key pair in your AWS account — leave empty to disable SSH
+ec2_key_pair_name = "my-key-pair"
+
+# ── WAF ──────────────────────────────────────────────────────────────────────
+# Requests per 5-minute window per IP before WAF blocks the source
+waf_rate_limit = 1000
+
+# ── CloudWatch Alarm ─────────────────────────────────────────────────────────
+# Alarm fires when WAF blocks this many requests within a single 1-minute period
+alarm_blocked_requests_threshold = 50
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+alarm_email     = "elinor.einav@gmail.com"
+
+# Start ngrok in front of your local n8n first, then paste the webhook URL:
+#   ngrok http 5678
+# In n8n, create a Webhook trigger node and copy its Test/Production URL.
+n8n_webhook_url = "https://REPLACE_WITH_NGROK_URL.ngrok.io/webhook/REPLACE_WITH_WEBHOOK_ID"
+
+# ── Splunk HEC ────────────────────────────────────────────────────────────────
+# Run ngrok in front of your local Splunk HEC port first:
+#   ngrok http 8088
+# Paste the ngrok HTTPS base URL below (no path — Firehose appends it).
+splunk_hec_endpoint = "https://REPLACE_WITH_NGROK_URL.ngrok.io"
+
+# Set via environment variable instead of writing here:
+#   export TF_VAR_splunk_hec_token="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+splunk_hec_token = "REPLACE_WITH_YOUR_HEC_TOKEN"
+
+splunk_index = "devsecops_security"

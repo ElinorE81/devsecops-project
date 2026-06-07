@@ -1,0 +1,178 @@
+name: CI/CD — Test, Build & Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:    # allow manual triggers from the GitHub UI (useful for demos)
+
+env:
+  PYTHON_VERSION: "3.11"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#
+#   AWS_ACCESS_KEY_ID      IAM user access key with ECR push + ASG refresh rights
+#   AWS_SECRET_ACCESS_KEY  Corresponding secret key
+#   AWS_REGION             e.g. us-east-1
+#   ECR_REPOSITORY         Short repo name from Terraform output, e.g. devsecops-prod/app
+#   ASG_NAME               From Terraform output, e.g. devsecops-prod-asg
+# ──────────────────────────────────────────────────────────────────────────────
+
+jobs:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 1 — Test
+  # Installs dependencies and runs the pytest suite.  The build job will not
+  # start until this job exits successfully.
+  # ────────────────────────────────────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            app/requirements.txt
+            app/requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r app/requirements.txt -r app/requirements-dev.txt
+
+      - name: Run pytest
+        run: pytest app/test_app.py -v --tb=short
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 2 — Build & Push to ECR
+  # Builds the Docker image and pushes two tags:
+  #   :latest   — pulled by new ASG instances via the launch template user-data
+  #   :<sha>    — immutable tag for audit trail and rollback
+  # ────────────────────────────────────────────────────────────────────────────
+  build-and-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: test
+
+    outputs:
+      image_tag: ${{ steps.build.outputs.image_tag }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag and push Docker image
+        id: build
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -t "$REGISTRY/$REPOSITORY:$IMAGE_TAG" \
+            -t "$REGISTRY/$REPOSITORY:latest" \
+            ./app
+
+          docker push "$REGISTRY/$REPOSITORY:$IMAGE_TAG"
+          docker push "$REGISTRY/$REPOSITORY:latest"
+
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "Pushed: $REGISTRY/$REPOSITORY:$IMAGE_TAG"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 3 — Deploy (Zero-Downtime ASG Instance Refresh)
+  # Starts a rolling replacement of all EC2 instances in the Auto Scaling Group.
+  # New instances boot from the launch template, pull :latest from ECR, and are
+  # only registered with the ALB after passing the /health check.  Old instances
+  # are terminated only after new ones are healthy (MinHealthyPercentage: 50).
+  # ────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy — ASG Rolling Refresh
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Start ASG instance refresh
+        id: refresh
+        env:
+          ASG_NAME: ${{ secrets.ASG_NAME }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+        run: |
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --preferences '{
+              "MinHealthyPercentage": 50,
+              "InstanceWarmup": 90
+            }' \
+            --query 'InstanceRefreshId' \
+            --output text)
+
+          echo "Instance refresh started — ID: $REFRESH_ID  Image: $IMAGE_TAG"
+          echo "refresh_id=$REFRESH_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for refresh to complete
+        timeout-minutes: 15
+        env:
+          ASG_NAME: ${{ secrets.ASG_NAME }}
+          REFRESH_ID: ${{ steps.refresh.outputs.refresh_id }}
+        run: |
+          echo "Polling refresh $REFRESH_ID every 30 seconds (timeout: 15 min)..."
+
+          for attempt in $(seq 1 30); do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query 'InstanceRefreshes[0].Status' \
+              --output text)
+
+            PCT=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query 'InstanceRefreshes[0].PercentageComplete' \
+              --output text 2>/dev/null || echo "N/A")
+
+            echo "  [attempt $attempt/30] Status: $STATUS  Progress: ${PCT}%"
+
+            case "$STATUS" in
+              Successful)
+                echo "Deployment complete — all instances running new image."
+                exit 0
+                ;;
+              Failed|Cancelled)
+                echo "Deployment failed with status: $STATUS"
+                exit 1
+                ;;
+              RollbackSuccessful|RollbackFailed)
+                echo "ASG rolled back. Status: $STATUS — check the AWS Console."
+                exit 1
+                ;;
+            esac
+
+            sleep 30
+          done
+
+          echo "Timeout: refresh did not complete within the allotted time."
+          exit 1

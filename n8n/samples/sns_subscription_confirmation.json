@@ -1,0 +1,14 @@
+{
+  "_comment": "AWS SNS sends this exact structure as the FIRST request to your n8n webhook URL immediately after 'terraform apply' creates the aws_sns_topic_subscription resource. You must visit the SubscribeURL to confirm the subscription before live alarm notifications will be delivered. See stage7-bridge-setup.md for instructions.",
+
+  "Type": "SubscriptionConfirmation",
+  "MessageId": "165545c9-2a5c-472d-8427-1234567890ab",
+  "Token": "2336412f37f...(long token)...3f61a0d8",
+  "TopicArn": "arn:aws:sns:us-east-1:123456789012:devsecops-prod-security-alerts",
+  "Message": "You have chosen to subscribe to the topic arn:aws:sns:us-east-1:123456789012:devsecops-prod-security-alerts. To confirm the subscription, visit the SubscribeURL included in this message.",
+  "SubscribeURL": "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription&TopicArn=arn:aws:sns:us-east-1:123456789012:devsecops-prod-security-alerts&Token=2336412f37f...3f61a0d8",
+  "Timestamp": "2026-06-06T12:00:00.000Z",
+  "SignatureVersion": "1",
+  "Signature": "EXAMPLE+SIGNATURE==",
+  "SigningCertURL": "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc123.pem"
+}

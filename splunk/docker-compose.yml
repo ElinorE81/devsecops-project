@@ -1,0 +1,40 @@
+services:
+
+  splunk:
+    image: splunk/splunk:9.2
+    container_name: splunk-devsecops
+    hostname: splunk-devsecops
+    environment:
+      SPLUNK_START_ARGS: "--accept-license"
+      # Override in .env or export before running docker compose up
+      SPLUNK_PASSWORD: "${SPLUNK_ADMIN_PASSWORD:-DevSecOps2026!}"
+      # This token value is pre-loaded into Splunk's HEC on first boot.
+      # Copy it to terraform.tfvars as splunk_hec_token and to n8n variables.
+      SPLUNK_HEC_TOKEN: "${SPLUNK_HEC_TOKEN:-b7e2c1d4-a3f8-4e92-8b6d-1234567890ab}"
+    ports:
+      - "8000:8000"   # Splunk Web UI  → browse http://localhost:8000
+      - "8088:8088"   # HTTP Event Collector (HEC) → expose to AWS via ngrok
+      - "8089:8089"   # Splunk REST API → queried by n8n workflow
+    volumes:
+      - splunk-var:/opt/splunk/var
+      - splunk-etc:/opt/splunk/etc
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/en-US/account/login"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
+      start_period: 120s   # Splunk takes ~90s on first start
+    networks:
+      - devsecops-net
+
+networks:
+  # Shared network — add your existing n8n container to this network so it can
+  # reach Splunk at http://splunk-devsecops:8089 without going through the host.
+  # If n8n runs in a separate compose project, use host.docker.internal:8089 instead.
+  devsecops-net:
+    driver: bridge
+
+volumes:
+  splunk-var:
+  splunk-etc:

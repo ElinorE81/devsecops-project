@@ -1,0 +1,16 @@
+{
+  "_comment": "This is the full JSON body that AWS SNS POSTs to the n8n webhook URL when the CloudWatch WAF alarm transitions to ALARM state. Use this to build and test your n8n workflow offline before the real infrastructure is live.",
+
+  "Type": "Notification",
+  "MessageId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "TopicArn": "arn:aws:sns:us-east-1:123456789012:devsecops-prod-security-alerts",
+  "Subject": "ALARM: \"devsecops-prod-waf-blocked-requests\" in US East (N. Virginia)",
+
+  "Message": "{\"AlarmName\":\"devsecops-prod-waf-blocked-requests\",\"AlarmDescription\":\"WAF is blocking requests — possible Layer 7 flood in progress. Check Splunk dashboard.\",\"AWSAccountId\":\"123456789012\",\"NewStateValue\":\"ALARM\",\"NewStateReason\":\"Threshold Crossed: 1 out of the last 1 datapoints [87.0 (06/06/26 14:32:00)] was greater than or equal to the threshold (50.0) (minimum 1 datapoint for OK -> ALARM transition).\",\"StateChangeTime\":\"2026-06-06T14:33:00.000+0000\",\"Region\":\"US East (N. Virginia)\",\"OldStateValue\":\"OK\",\"AlarmArn\":\"arn:aws:cloudwatch:us-east-1:123456789012:alarm:devsecops-prod-waf-blocked-requests\",\"Trigger\":{\"MetricName\":\"BlockedRequests\",\"Namespace\":\"AWS/WAFV2\",\"StatisticType\":\"Statistic\",\"Statistic\":\"SUM\",\"Unit\":null,\"Dimensions\":[{\"value\":\"devsecops-prod-web-acl\",\"name\":\"WebACL\"},{\"value\":\"us-east-1\",\"name\":\"Region\"},{\"value\":\"RateLimitRule\",\"name\":\"Rule\"}],\"Period\":60,\"EvaluationPeriods\":1,\"ComparisonOperator\":\"GreaterThanOrEqualToThreshold\",\"Threshold\":50.0,\"TreatMissingData\":\"notBreaching\"}}",
+
+  "Timestamp": "2026-06-06T14:33:00.123Z",
+  "SignatureVersion": "1",
+  "Signature": "EXAMPLE+SIGNATURE+NOT+VALID+FOR+VERIFICATION==",
+  "SigningCertURL": "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc123.pem",
+  "UnsubscribeURL": "https://sns.us-east-1.amazonaws.com/?Action=Unsubscribe&SubscriptionArn=arn:aws:sns:us-east-1:123456789012:devsecops-prod-security-alerts:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+}

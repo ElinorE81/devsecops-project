@@ -1,0 +1,288 @@
+<dashboard version="1.1" theme="dark">
+  <label>DevSecOps — Security Operations Center</label>
+  <description>Real-time Layer 7 HTTP flood detection, WAF blocking, CPU stress proxy, and incident timeline. Auto-refreshes every 30 seconds. Index: devsecops_security</description>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       ROW 1 — KPI TILES (last 15 minutes)
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <row>
+    <panel>
+      <title>WAF Blocked Requests (–15 min)</title>
+      <single>
+        <search>
+          <query>index=devsecops_security sourcetype="aws:waf" action=BLOCK earliest=-15m latest=now | stats count as blocked</query>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
+        </search>
+        <option name="colorBy">value</option>
+        <option name="colorMode">block</option>
+        <option name="rangeColors">["0x53a051","0xf8be34","0xf1813f","0xdc4e41"]</option>
+        <option name="rangeValues">[0,10,50]</option>
+        <option name="useColors">1</option>
+        <option name="numberPrecision">0</option>
+        <option name="underLabel">BLOCKED</option>
+      </single>
+    </panel>
+
+    <panel>
+      <title>Total Requests Received (–15 min)</title>
+      <single>
+        <search>
+          <query>index=devsecops_security sourcetype="aws:waf" earliest=-15m latest=now | stats count as total</query>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
+        </search>
+        <option name="numberPrecision">0</option>
+        <option name="underLabel">TOTAL</option>
+      </single>
+    </panel>
+
+    <panel>
+      <title>Unique Attacking IPs (–15 min)</title>
+      <single>
+        <search>
+          <query>index=devsecops_security sourcetype="aws:waf" action=BLOCK earliest=-15m latest=now | stats dc(httpRequest.clientIp) as unique_ips</query>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
+        </search>
+        <option name="colorBy">value</option>
+        <option name="colorMode">block</option>
+        <option name="rangeColors">["0x53a051","0xf8be34","0xdc4e41"]</option>
+        <option name="rangeValues">[0,1]</option>
+        <option name="useColors">1</option>
+        <option name="underLabel">UNIQUE IPs</option>
+      </single>
+    </panel>
+
+    <panel>
+      <title>Avg App Response Time (–15 min)</title>
+      <!-- High response time = EC2 CPU stress from the prime-computation flood -->
+      <single>
+        <search>
+          <query>index=devsecops_security sourcetype="app:flask" earliest=-15m latest=now | stats avg(duration_ms) as avg_ms | eval avg_ms=round(avg_ms,1)</query>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
+        </search>
+        <option name="unit">ms</option>
+        <option name="colorBy">value</option>
+        <option name="colorMode">block</option>
+        <option name="rangeColors">["0x53a051","0xf8be34","0xf1813f","0xdc4e41"]</option>
+        <option name="rangeValues">[0,50,200]</option>
+        <option name="useColors">1</option>
+        <option name="underLabel">AVG LATENCY</option>
+      </single>
+    </panel>
+  </row>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       ROW 2 — HTTP FLOOD TIMELINE
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <row>
+    <panel>
+      <title>HTTP Flood Timeline — Requests per 30s by Source IP (Top 5)</title>
+      <chart>
+        <search>
+          <query>index=devsecops_security sourcetype="aws:waf" earliest=-60m latest=now
+| timechart span=30s count by httpRequest.clientIp limit=5 useother=false</query>
+          <earliest>-60m</earliest>
+          <latest>now</latest>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
+        </search>
+        <option name="charting.chart">line</option>
+        <option name="charting.chart.nullValueMode">zero</option>
+        <option name="charting.chart.showDataLabels">none</option>
+        <option name="charting.legend.placement">bottom</option>
+        <option name="charting.axisTitleX.visibility">collapsed</option>
+        <option name="charting.axisY.title">Requests / 30s</option>
+        <option name="charting.drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+        <option name="height">300</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       ROW 3 — WAF ACTIONS + CPU STRESS PROXY (side by side)
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <row>
+    <panel>
+      <title>WAF Actions Over Time — BLOCK vs ALLOW</title>
+      <chart>
+        <search>
+          <query>index=devsecops_security sourcetype="aws:waf" earliest=-60m latest=now
+| timechart span=30s count by action</query>
+          <earliest>-60m</earliest>
+          <latest>now</latest>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
+        </search>
+        <option name="charting.chart">column</option>
+        <option name="charting.chart.stackMode">stacked</option>
+        <option name="charting.legend.placement">bottom</option>
+        <option name="charting.fieldColors">{"BLOCK":"#DC4E41","ALLOW":"#53A051","COUNT":"#F8BE34"}</option>
+        <option name="charting.drilldown">none</option>
+        <option name="height">280</option>
+      </chart>
+    </panel>
+
+    <panel>
+      <title>CPU Stress Proxy — App Response Time Under Flood</title>
+      <!-- As EC2 CPU saturates from prime calculations, p95 latency spikes.
+           This correlates visually with the WAF block timeline above. -->
+      <chart>
+        <search>
+          <query>index=devsecops_security sourcetype="app:flask" earliest=-60m latest=now
+| timechart span=30s
+    avg(duration_ms) as "Avg Response (ms)"
+    perc95(duration_ms) as "p95 Response (ms)"</query>
+          <earliest>-60m</earliest>
+          <latest>now</latest>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
+        </search>
+        <option name="charting.chart">area</option>
+        <option name="charting.chart.nullValueMode">zero</option>
+        <option name="charting.legend.placement">bottom</option>
+        <option name="charting.axisY.title">Milliseconds</option>
+        <option name="charting.fieldColors">{"Avg Response (ms)":"#F8BE34","p95 Response (ms)":"#DC4E41"}</option>
+        <option name="charting.drilldown">none</option>
+        <option name="height">280</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       ROW 4 — TOP ATTACKERS (chart + detail table)
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <row>
+    <panel>
+      <title>Top Attacking IPs by Blocked Request Count</title>
+      <chart>
+        <search>
+          <query>index=devsecops_security sourcetype="aws:waf" action=BLOCK earliest=-60m latest=now
+| stats count as "Blocked Requests" by httpRequest.clientIp
+| sort -"Blocked Requests"
+| head 10
+| rename httpRequest.clientIp as "Source IP"</query>
+          <earliest>-60m</earliest>
+          <latest>now</latest>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
+        </search>
+        <option name="charting.chart">bar</option>
+        <option name="charting.legend.placement">none</option>
+        <option name="charting.drilldown">none</option>
+        <option name="height">280</option>
+      </chart>
+    </panel>
+
+    <panel>
+      <title>Attacker Detail — Context for SOC Investigation</title>
+      <table>
+        <search>
+          <query>index=devsecops_security sourcetype="aws:waf" action=BLOCK earliest=-60m latest=now
+| stats
+    count as "Blocked"
+    dc(httpRequest.uri) as "URIs Hit"
+    values(httpRequest.uri) as "Targeted Paths"
+    values(httpRequest.country) as "Country"
+    earliest(_time) as first_epoch
+    latest(_time) as last_epoch
+  by httpRequest.clientIp
+| eval "First Seen" = strftime(first_epoch, "%H:%M:%S")
+| eval "Last Seen"  = strftime(last_epoch,  "%H:%M:%S")
+| eval "Duration"   = tostring(last_epoch - first_epoch, "duration")
+| sort -Blocked
+| head 10
+| rename httpRequest.clientIp as "Attacker IP"
+| fields "Attacker IP" Blocked "URIs Hit" "Targeted Paths" Country "First Seen" "Last Seen" Duration</query>
+          <earliest>-60m</earliest>
+          <latest>now</latest>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
+        </search>
+        <option name="wrap">true</option>
+        <option name="rowNumbers">true</option>
+        <option name="drilldown">none</option>
+        <format type="color" field="Blocked">
+          <colorPalette type="minMidMax" minColor="#53A051" midColor="#F8BE34" maxColor="#DC4E41"/>
+        </format>
+      </table>
+    </panel>
+  </row>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       ROW 5 — APPLICATION ERROR RATE
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <row>
+    <panel>
+      <title>Application HTTP Status Breakdown Over Time</title>
+      <chart>
+        <search>
+          <query>index=devsecops_security sourcetype="app:flask" earliest=-60m latest=now
+| eval status_class=case(
+    status_code>=500, "5xx Server Error",
+    status_code>=400, "4xx Client Error",
+    status_code>=200, "2xx Success",
+    1=1, "Other")
+| timechart span=30s count by status_class</query>
+          <earliest>-60m</earliest>
+          <latest>now</latest>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
+        </search>
+        <option name="charting.chart">column</option>
+        <option name="charting.chart.stackMode">stacked</option>
+        <option name="charting.legend.placement">bottom</option>
+        <option name="charting.fieldColors">{"5xx Server Error":"#DC4E41","4xx Client Error":"#F1813F","2xx Success":"#53A051"}</option>
+        <option name="charting.drilldown">none</option>
+        <option name="height">240</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- ═══════════════════════════════════════════════════════════════════════
+       ROW 6 — INCIDENT TIMELINE (full audit trail)
+       ═══════════════════════════════════════════════════════════════════════ -->
+  <row>
+    <panel>
+      <title>Incident Timeline — Last 100 Security Events (newest first)</title>
+      <table>
+        <search>
+          <query>index=devsecops_security earliest=-60m latest=now
+  (sourcetype="aws:waf" action=BLOCK)
+  OR (sourcetype="app:flask" status_code>=400)
+| eval event_type=case(
+    sourcetype="aws:waf" AND action="BLOCK",  "WAF Block",
+    sourcetype="app:flask" AND status_code>=500, "App 5xx Error",
+    sourcetype="app:flask" AND status_code>=400, "App 4xx",
+    1=1, "Other")
+| eval src_ip  = coalesce(httpRequest.clientIp, ip)
+| eval path    = coalesce(httpRequest.uri, endpoint)
+| eval rule    = coalesce(terminatingRuleId, "-")
+| eval latency = if(isnotnull(duration_ms), duration_ms . " ms", "-")
+| table _time event_type src_ip path rule status_code latency
+| rename _time as "Time" event_type as "Event" src_ip as "Source IP"
+         path as "Path" rule as "WAF Rule" status_code as "HTTP Status"
+         latency as "Latency"
+| sort -Time
+| head 100</query>
+          <earliest>-60m</earliest>
+          <latest>now</latest>
+          <refresh>30s</refresh>
+          <refreshType>delay</refreshType>
+        </search>
+        <option name="rowNumbers">true</option>
+        <option name="wrap">false</option>
+        <option name="drilldown">none</option>
+        <format type="color" field="Event">
+          <colorPalette type="map">{"WAF Block":"#DC4E41","App 5xx Error":"#F1813F","App 4xx":"#F8BE34"}</colorPalette>
+        </format>
+        <format type="color" field="HTTP Status">
+          <colorPalette type="map">{"200":"#53A051","403":"#F1813F","429":"#DC4E41","500":"#DC4E41","404":"#F8BE34"}</colorPalette>
+        </format>
+      </table>
+    </panel>
+  </row>
+</dashboard>
