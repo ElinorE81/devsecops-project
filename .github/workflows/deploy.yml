@@ -29,5 +29,9 @@ jobs:
           ECR_REPOSITORY: devsecops-prod/app
           IMAGE_TAG: latest
         run: |
+          # נכנסים לתיקיית האפליקציה כדי למצוא את ה-Dockerfile
+          cd app
+          # בונים את האימג'
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          # דוחפים אותו ל-ECR
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
